@@ -8,38 +8,39 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
+          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "KeepAliveEnable" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "KeepAliveInterval" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "KeepAliveTimeout" -Value 1 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # Configure firewall (ignore if rule doesn't exist)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null || echo "Firewall rule not found, creating new one..."
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          
           Restart-Service -Name TermService -Force
+          Write-Host "✅ RDP configuration completed"
 
-      - name: Create RDP User with Static Password
+      - name: Create RDP User with Secure Password
         run: |
-          $password = "sssddd333"
+          # Use a stronger password that meets Windows requirements
+          $password = "Sifodz@123456"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          if (-not (Get-LocalUser -Name "SIFODZ" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "SIFODZ" -Password $securePass -AccountNeverExpires
-          }
-
+          # Remove user if exists
+          Remove-LocalUser -Name "SIFODZ" -ErrorAction SilentlyContinue
+          
+          # Create user with proper parameters
+          New-LocalUser -Name "SIFODZ" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          
+          # Add to groups
           Add-LocalGroupMember -Group "Administrators" -Member "SIFODZ"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "SIFODZ"
-
-          # Set user to never expire and enable account
-          Set-LocalUser -Name "SIFODZ" -PasswordNeverExpires $true -AccountNeverExpires
+          
+          # Enable the account
           Enable-LocalUser -Name "SIFODZ"
 
           echo "RDP_CREDS=User: SIFODZ | Password: $password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "SIFODZ")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          Write-Host "✅ User created successfully"
 
       - name: Install Tailscale
         run: |
@@ -49,98 +50,56 @@ jobs:
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          Write-Host "✅ Tailscale installed"
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --reset
+          # Wait for Tailscale service to start
+          Start-Sleep -Seconds 10
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 20) {
+          while (-not $tsIP -and $retries -lt 15) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 10
-              $retries++
+              if (-not $tsIP) {
+                  $retries++
+                  Start-Sleep -Seconds 5
+              }
           }
+          
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "❌ Tailscale IP not assigned after $retries attempts"
               exit 1
           }
+          
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Configure System for Long Running
-        run: |
-          # Disable sleep and power saving
-          powercfg -change -standby-timeout-ac 0
-          powercfg -change -hibernate-timeout-ac 0
-          powercfg -change -monitor-timeout-ac 0
-          powercfg -change -disk-timeout-ac 0
-          
-          # Set high performance power plan
-          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-          
-          # Prevent system from going idle
-          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          Write-Host "✅ Tailscale connected - IP: $tsIP"
 
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+          Write-Host "Testing RDP connection to: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          if (-not $testResult) {
+              Write-Error "❌ RDP connection test failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "✅ RDP connectivity successful!"
 
       - name: Maintain Connection
         run: |
-          $startTime = Get-Date
-          $endTime = $startTime.AddMinutes(10080)
-          
-          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host ""
+          Write-Host "=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: SIFODZ"
-          Write-Host "Password: sssddd333"
-          Write-Host "Start Time: $startTime"
-          Write-Host "End Time: $endTime"
-          Write-Host "Duration: 7 DAYS (10080 minutes)"
-          Write-Host "==================`n"
+          Write-Host "Password: Sifodz@123456"
+          Write-Host "Duration: 7 DAYS"
+          Write-Host "=================="
+          Write-Host ""
           
-          # Continuous monitoring loop
+          # Simple keep-alive loop
           while ($true) {
-              $currentTime = Get-Date
-              $remaining = $endTime - $currentTime
-              $days = $remaining.Days
-              $hours = $remaining.Hours
-              $minutes = $remaining.Minutes
-              
-              # Check and restart critical services every 30 minutes
-              if ((Get-Date).Minute % 30 -eq 0) {
-                  $services = @("TermService", "SessionEnv", "UmRdpService", "Tailscale")
-                  foreach ($service in $services) {
-                      $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
-                      if ($svc -and $svc.Status -ne 'Running') {
-                          Write-Host "Restarting service: $service"
-                          Start-Service -Name $service
-                      }
-                  }
-              }
-              
-              # Verify RDP is still accessible every hour
-              if ((Get-Date).Minute % 60 -eq 0) {
-                  try {
-                      $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-                      if (-not $test.TcpTestSucceeded) {
-                          Write-Host "RDP connection lost - restarting Terminal Services"
-                          Restart-Service -Name TermService -Force
-                      }
-                  } catch {
-                      Write-Host "Network test failed - retrying..."
-                  }
-              }
-              
-              Write-Host "[$(Get-Date)] RDP Active - Time remaining: $days days, $hours hours, $minutes minutes"
-              
-              # Keep the session alive with small tasks
-              $null = Get-Process -ErrorAction SilentlyContinue
-              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Session Active - 7 Days"
               Start-Sleep -Seconds 300
           }
